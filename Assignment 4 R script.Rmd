@@ -1,0 +1,429 @@
+---
+title: "BINF 6210 Final Assignment 4"
+author: "Lishita Rowjee"
+date: "2025-11-22"
+output: html_document
+---
+GitHub link: https://github.com/LishitaR/BINF-6210-Assignment-4 
+
+**Introduction**
+The traditional identification method of fungal species is based on morphology. Many *Aspergillus* species are similar in morphology making accurate identification challenging. DNA barcoding using the Internal Transcribed Spacer (ITS) region has become a standard approach. ITS is easy to amplify, universally present in fungi, and usually contains sufficient interspecific variation for species discrimination (Schoch et al., 2012). However, ITS has limitations: it may be too conserved to distinguish closely related species, and public databases such as BOLD and NCBI contain low-quality or mislabeled sequences (Nilsson et al., 2019)
+
+#Research question 
+Can ITS sequences from BOLD + NCBI accurately classify *Aspergillus fumigatus,niger and flavus* species using machine learning, and what sources of bias or error affect classification accuracy?
+
+## Hypotheses
+H1: ITS 3-mer profiles contain enough variation to allow accurate classification of *A. fumigatus*, *A. niger*, and *A. flavus* using machine-learning models.
+
+H2: ITS k-mer profiles of *A. fumigatus*, *A. niger*, and *A. flavus* may overlap, leading to misclassification in PCA and machine-learning models.
+
+H3: Sequencing errors, low-quality sequences, and ambiguous bases (N’s) are present in public ITS datasets (BOLD + NCBI), and these quality issues can be detected through exploratory sequence metrics and removed through preprocessing.
+
+H4: Unequal numbers of sequences per species exist in the dataset, which may influence downstream machine learning analyses.
+
+# 1. Setup: Install and Load packages
+
+```{r setup, message=TRUE, warning=FALSE}
+# List of required packages
+required_packages <- c(
+  "tidyverse", "Biostrings", "DECIPHER", "caret",
+  "janitor", "ggpubr", "reshape2",
+  "randomForest", "e1071", "doParallel", "BiocManager", "ggfortify", "kernlab", "xgboost"
+)
+
+# Function to install (if needed) and load a single package
+install_and_load <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    # Bioconductor packages
+    if (pkg %in% c("Biostrings", "DECIPHER")) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  
+  # Load the package
+  tryCatch({
+    library(pkg, character.only = TRUE)
+    message(paste("✅ Package loaded:", pkg))
+  }, error = function(e) {
+    message(paste("❌ Failed to load package:", pkg))
+  })
+}
+
+# Apply the function to all packages using lapply
+invisible(lapply(required_packages, install_and_load))
+```
+
+# 2. Data acquisition and loading
+
+##2.1 BOLD database:
+Downloaded Aspergillus data set from https://portal.boldsystems.org/result?query=Aspergillus[tax]
+
+```{r, message= FALSE, warning= FALSE}
+bold_data <- read_tsv ("../data/Aspergillus_BOLD_data.tsv")
+
+head(bold_data)
+
+```
+
+##2.2 NCBI 
+looking for *Aspergillus* species having published ITS.
+
+```{r}
+library(rentrez)
+search <- entrez_search(
+  db = "nuccore", term = 'Aspergillus fumigatus[Organism] OR Aspergillus niger[Organism] OR Aspergillus flavus[Organism] AND "internal transcribed spacer"[Title]', use_history = T)
+
+search
+
+```
+The number of hits from NCBI is the same (14117) as that on the NCBI website after searching for 'Aspergillus fumigatus[Organism] OR Aspergillus niger[Organism] OR Aspergillus flavus[Organism] AND "internal transcribed spacer"[Title]' in the nucleotide database.(as of 16th November 2025, number of hits subject to change, but the FASTA file from mentioned date was downloaded and used for this assignment)
+
+Downloaded FASTA file.
+Upload file to R
+
+```{r, message= FALSE, warning= FALSE}
+st_aspergillus = readDNAStringSet("../data/sequence.fasta")
+
+st_aspergillus
+
+```
+
+# 3. BOLD and NCBI Data wrangling 
+
+##3.1 Bold data:
+removing NA values, keeping only Aspergillus fumigatus, Aspergillus niger, Aspergillus flavus species with ITS data and adding a source column "BOLD" to track where sequences came from after merging with NCBI data.
+
+```{r, message= FALSE, warning= FALSE}
+
+target_species <- c("Aspergillus fumigatus", "Aspergillus niger", "Aspergillus flavus")
+```
+
+```{r, message= FALSE, warning= FALSE}
+bold_df <- bold_data %>% filter(marker_code == "ITS") %>% select(nuc, species,`country/ocean`) %>% filter(!is.na(nuc) & nuc != "", !is.na(species) & species != "") %>% 
+  mutate( Source = "BOLD", Sequence = toupper(nuc), Species = species) %>% 
+  select(-nuc, -species) %>% filter(Species %in% target_species)   
+
+```
+
+Quick check
+
+```{r, message=FALSE, warning=FALSE}
+dim(bold_df)
+head(bold_df)
+
+```
+
+
+
+
+##3.2 NCBI Fasta Sequences
+
+Putting FASTA data in a dataframe
+```{r, message=FALSE, warning=TRUE}
+ncbi_df <- data.frame(
+  Header = names(st_aspergillus), Sequence = toupper(as.character(st_aspergillus)), stringsAsFactors = FALSE)
+
+```
+
+Adding source column (NCBI) and splitting long header name into species names which is the 2nd and 3rd word
+
+```{r, message=FALSE, warning=TRUE}
+ncbi_df <- data.frame(
+  Header = names(st_aspergillus), 
+  Sequence = toupper(as.character(st_aspergillus)), 
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    Species = sapply(strsplit(Header, " "), function(x) paste(x[2], x[3], sep=" ")),
+    Source = "NCBI"
+  ) %>%
+  select(Species, Sequence, Source) 
+
+head(ncbi_df)
+
+```
+
+##3.3 Combining BOLD and NCBI dataframe
+
+```{r, message=FALSE, warning=TRUE}
+all_seqs <- bind_rows(bold_df %>% select(Species, Sequence, Source), ncbi_df %>% select(Species, Sequence, Source))
+
+# Check combined size
+dim(all_seqs)
+table(all_seqs$Source)
+
+```
+
+# 4. Data Cleaning for H3
+
+Remove sequences that are too short
+
+```{r, message=FALSE, warning=TRUE}
+all_clean <- all_seqs %>%
+  mutate(Length = nchar(Sequence)) %>%
+  filter(Length >= 400)
+
+```
+
+Remove sequences with >3% ambiguous sequences
+
+```{r, message=FALSE, warning=TRUE}
+all_clean <- all_clean %>%
+  mutate(N_percent = str_count(Sequence, "N") / Length) %>%
+  filter(N_percent <= 0.03)
+
+```
+
+Remove species with fewer than 200 sequences (for ML stability)
+
+```{r, message=FALSE, warning=TRUE}
+species_count <- table(all_clean$Species)
+
+all_clean <- all_clean %>%
+  filter(Species %in% names(species_count[species_count >= 200]))
+
+```
+
+Remove unnecessary dataframes
+```{r, message=FALSE, warning=TRUE}
+rm(bold_data, ncbi_df, bold_df, st_aspergillus, all_seqs)
+
+```
+
+#5. Inspect cleaned data set (H4)
+
+```{r, message=FALSE, warning=TRUE}
+table(all_clean$Species)
+
+barplot(sort(table(all_clean$Species), decreasing=TRUE),
+        main="Class Distribution")
+
+
+```
+
+# 6. Exploration figures for H3
+
+##6.1 Sequence Length Histogram
+
+```{r, message= FALSE, warning=FALSE}
+ggplot(all_clean, aes(x=Length, fill=Source)) +
+  geom_histogram(bins=40, alpha=0.7) +
+  labs(title="Sequence Length Distribution", x="Length (bp)", y="Count")
+
+```
+
+##6.2 GC content
+
+```{r, message= FALSE, warning =FALSE}
+calc_gc <- function(seq) {
+  gc <- str_count(seq, "[GC]")
+  gc / nchar(seq)
+}
+
+all_clean$GC <- sapply(all_clean$Sequence, calc_gc)
+
+ggplot(all_clean, aes(GC, fill=Source)) +
+  geom_density(alpha=0.6) +
+  labs(title="GC Content Distribution", x="GC Proportion")
+
+```
+
+
+#7. k-mer Encoding (for PCA and Machine Learning)
+
+```{r, message= FALSE, warning =FALSE}
+compute_kmers <- function(seq, k=3) {
+  as.numeric(oligonucleotideFrequency(DNAString(seq), width=k))
+}
+
+k <- 3
+kmer_matrix <- t(sapply(all_clean$Sequence, compute_kmers, k=k))
+rownames(kmer_matrix) <- all_clean$Species
+
+```
+
+# 8. PCA (for H1 and H2)
+
+```{r, message= FALSE, warning =FALSE}
+
+pca_res <- prcomp(kmer_matrix, scale.=TRUE)
+
+autoplot(pca_res, data=all_clean, colour="Species", frame= TRUE, frame.type = "norm") +
+  labs(title="PCA of 3-mer Features")
+
+```
+
+# 9. Machine Learning Models (Test H1-H3)
+
+##9.1 Splitting data
+
+```{r, message= FALSE, warning =FALSE}
+set.seed(123)
+
+trainIndex <- createDataPartition(all_clean$Species, p=0.8, list=FALSE)
+
+train_X <- kmer_matrix[trainIndex,]
+train_y <- all_clean$Species[trainIndex]
+
+test_X <- kmer_matrix[-trainIndex,]
+test_y <- all_clean$Species[-trainIndex]
+
+```
+
+##9.2 Random Forest
+
+### Training
+For this chunk of code, ntree=300 was used to reduce training time. 
+```{r, message= FALSE, warning =FALSE}
+rf_model <- randomForest(
+  x = train_X,
+  y = as.factor(train_y),
+  ntree = 300, mtry = floor(sqrt(ncol(train_X))),
+  sampsize = floor(0.8 * nrow(train_X)),
+  importance = FALSE)
+```
+
+### Prediction
+```{r, message= FALSE, warning =FALSE}
+rf_pred <- predict(rf_model, test_X)
+```
+
+### Confusion matrix
+```{r, message= FALSE, warning =FALSE}
+rf_conf <- confusionMatrix(rf_pred, as.factor(test_y))
+rf_conf
+```
+
+### Importance
+```{r, message= FALSE, warning =FALSE}
+rf_importance <- importance(rf_model, type = 1)  
+varImpPlot(rf_model, n.var = 20, main = "Top 20 k-mer Importances (RF)")
+
+```
+
+##9.3 SVM model
+
+###Training
+```{r, message= FALSE, warning= FALSE}
+
+svm_model <- ksvm(x = train_X, y = as.factor(train_y),
+kernel = "rbfdot", C = 1, cross = 0)
+```
+
+###Prediction
+```{r, message= FALSE, warning= FALSE}
+svm_pred <- predict(svm_model, test_X)
+```
+
+### Confusion matrix
+```{r, message= FALSE, warning= FALSE}
+svm_conf <- confusionMatrix(svm_pred, as.factor(test_y))
+
+svm_conf
+```
+
+##9.4 XG Boost Model
+The following websites were used as a reference to learn about the XGBoost model and code that it requires on R (https://www.hackerearth.com/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/,https://cran.r-project.org/web/packages/xgboost/vignettes/xgboostPresentation.html#xgboost-r-tutorial)
+
+###Training
+
+#### Convert labels to integers
+```{r, message=TRUE, warning=TRUE}
+label_map <- as.numeric(factor(train_y)) - 1  
+
+num_class <- length(unique(label_map))
+
+dtrain <- xgb.DMatrix(data = train_X, label = label_map)
+dtest  <- xgb.DMatrix(data = test_X)
+
+```
+
+#### Train multi-class XGBoost 
+
+```{r, message=TRUE, warning=TRUE}
+params <- list(objective = "multi:softprob", num_class = num_class, eval_metric = "mlogloss", eta = 0.1,
+max_depth = 6)
+
+xgb_model <- xgb.train( params = params, data = dtrain,
+nrounds = 100, verbose = 0)
+
+```
+
+### Prediction
+```{r, message=TRUE, warning=TRUE}
+pred_probs <- predict(xgb_model, dtest)
+pred_matrix <- matrix(pred_probs, ncol = num_class, byrow = TRUE)
+pred_numeric <- max.col(pred_matrix) - 1  # zero-indexed
+
+```
+
+### Map back to original species names
+```{r, message=TRUE, warning=TRUE}
+levels_map <- levels(factor(train_y))
+xgb_pred <- levels_map[pred_numeric + 1]
+
+```
+
+### Confusion Matrix
+
+```{r, message=TRUE, warning=TRUE}
+confusionMatrix(as.factor(xgb_pred), as.factor(test_y))
+
+```
+
+# 10. Summary Table (randomForest, SVM and XGBoost)
+
+```{r, message= FALSE, warning= FALSE}
+# Ensure all three confusion matrices exist
+rf_acc   <- rf_conf$overall["Accuracy"]
+rf_kappa <- rf_conf$overall["Kappa"]
+
+svm_acc   <- svm_conf$overall["Accuracy"]
+svm_kappa <- svm_conf$overall["Kappa"]
+
+# XGBoost confusion matrix
+xgb_conf <- confusionMatrix(as.factor(xgb_pred), as.factor(test_y))
+
+xgb_acc   <- xgb_conf$overall["Accuracy"]
+xgb_kappa <- xgb_conf$overall["Kappa"]
+
+# summary table
+model_results <- data.frame(
+  Model = c("Random Forest", "SVM (RBF)", "XGBoost"),
+  Accuracy = c(rf_acc, svm_acc, xgb_acc),
+  Kappa = c(rf_kappa, svm_kappa, xgb_kappa)
+)
+
+model_results
+
+```
+
+# 11. Generate Pipeline
+
+```{r, echo=TRUE}
+
+script_path <- "./Assignment 4 R script.Rmd"
+
+
+lines <- readLines(script_path)
+
+
+header_lines <- grep("^#+", lines, value = TRUE)
+
+indent_levels <- sapply(gregexpr("^#+", header_lines), function(x) attr(x, "match.length"))
+
+
+tree_text <- sapply(seq_along(header_lines), function(i) {
+  indent <- strrep("    ", indent_levels[i] - 1)
+  paste0(indent, "├── ", trimws(gsub("^#+", "", header_lines[i])))
+})
+
+
+cat(paste(tree_text, collapse = "\n"))
+```
+
